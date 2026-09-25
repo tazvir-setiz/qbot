@@ -1,0 +1,11 @@
+morsel
+7487511931:AAE6PNxGABIS1uwl_EupE9WZ4yXG2Y-3slw
+-1002456000452
+source /home/cp63891064085/virtualenv/morsel/3.11/bin/activate && cd /home/cp63891064085/morsel
+
+ps -aux		// نشان دادن تسک ها 
+kill -9 pid	// 
+python -m pip install r.txt
+pip freeze	// ماژول های نصب شده
+chmod +x b.py // ران بکگراند
+nohup python b.py

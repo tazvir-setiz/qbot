@@ -1,0 +1,5 @@
+python-telegram-bot==22.3
+aiosqlite==0.21.0
+apscheduler==3.11.0
+pytz==2025.2
+jdatetime==5.2.0
