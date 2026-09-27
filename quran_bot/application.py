@@ -60,6 +60,8 @@ def main():
     # HTTP request logs include the token in the Telegram URL.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    # PTB debug logs contain entire updates, including password messages.
+    logging.getLogger("telegram").setLevel(logging.WARNING)
     with asyncio.Runner() as runner:
         runner.get_loop()
         app = build_application(config)

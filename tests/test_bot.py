@@ -1,5 +1,7 @@
 import asyncio
 import json
+import io
+import logging
 import sqlite3
 import tempfile
 import time
@@ -7,9 +9,10 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import anyio
+from apscheduler.events import EVENT_JOB_EXECUTED
 from telegram.error import BadRequest, ChatMigrated, NetworkError
 from telegram.request import HTTPXRequest
 
@@ -45,6 +48,129 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         query = SimpleNamespace(data=data, answer=AsyncMock())
         return SimpleNamespace(effective_message=message, effective_chat=SimpleNamespace(id=1, type="private"),
                                effective_user=SimpleNamespace(id=1), callback_query=query)
+
+    async def test_review_database_failure_recovers_without_resending(self):
+        original = self.repo.update
+        failed = False
+        async def fail_once(owner, **values):
+            nonlocal failed
+            if "current_page" in values and not failed:
+                failed = True
+                raise sqlite3.OperationalError("temporary write failure")
+            await original(owner, **values)
+        queued = []
+        self.service.queue = lambda owner, timestamp: queued.append(timestamp)
+        self.repo.update = fail_once
+        await self.service.deliver(1)
+        self.assertTrue(queued, "A database failure must schedule recovery")
+        await self.service.deliver(1)
+        self.bot.send_message.assert_awaited_once()
+        row = await self.repo.get(1)
+        self.assertEqual(row["current_page"], 2)
+        self.assertIsNotNone(row["next_run"])
+
+    async def test_review_completed_reading_cannot_resume(self):
+        await self.repo.update(1, current_index=1, current_page=3)
+        await self.service.deliver(1)
+        await self.handlers.callback(self.update(data="menu_resume"), SimpleNamespace(user_data={"authenticated": True}))
+        row = await self.repo.get(1)
+        self.assertEqual(row["active"], 0)
+        self.assertTrue(row.get("completed"))
+        await self.handlers.select(1, 0)
+        self.assertFalse((await self.repo.get(1))["completed"])
+
+    async def test_review_successful_send_survives_panel_failure(self):
+        update = self.update(data="media_confirm:abc")
+        update.effective_message.edit_text.side_effect = [NetworkError("panel unavailable"), None]
+        context = SimpleNamespace(user_data={"authenticated": True, "pending_media":
+            dict(nonce="abc", target=-123, expires=time.monotonic() + 60, chat_id=1, message_id=42)})
+        await self.handlers.callback(update, context)
+        self.bot.copy_message.assert_awaited_once()
+        self.assertIsNone((await self.repo.get(1))["last_error"])
+        self.assertIn("ارسال شد", update.effective_message.reply_text.call_args.args[0])
+
+    async def test_recovery_job_survives_repeated_database_failures(self):
+        service = DeliveryService(self.config, self.repo, self.surahs, self.bot)
+        original = self.repo.update
+        remaining = 2
+        async def fail_progress(owner, **values):
+            nonlocal remaining
+            if "current_page" in values and remaining:
+                remaining -= 1
+                raise sqlite3.OperationalError("temporary database failure")
+            await original(owner, **values)
+        self.repo.update = fail_progress
+        finished = asyncio.Event()
+        service.scheduler.add_listener(lambda event: finished.set(), EVENT_JOB_EXECUTED)
+        try:
+            await service.start()
+            await asyncio.wait_for(finished.wait(), 5)
+            self.assertIsNotNone(service.scheduler.get_job("daily_1"))
+            self.assertIn(1, service.storage_errors)
+            await service.deliver(1)
+            self.assertIsNotNone(service.scheduler.get_job("daily_1"))
+            await service.deliver(1)
+            self.bot.send_message.assert_awaited_once()
+            self.assertEqual((await self.repo.get(1))["current_page"], 2)
+            self.assertNotIn(1, service.storage_errors)
+        finally:
+            await service.stop()
+
+    async def test_restart_pauses_uncertain_delivery_instead_of_resending(self):
+        await self.repo.update(1, delivery_pending=1)
+        restarted = DeliveryService(self.config, Repository(self.path), self.surahs, self.bot)
+        try:
+            await restarted.start()
+            row = await self.repo.get(1)
+            self.assertEqual(row["active"], 0)
+            self.assertIn("نامشخص", row["last_error"])
+            self.assertFalse(restarted.scheduler.get_jobs())
+            await restarted.deliver(1)
+            self.bot.send_message.assert_not_awaited()
+        finally:
+            await restarted.stop()
+
+    async def test_database_failure_before_send_does_not_send(self):
+        original = self.repo.update
+        async def fail_marker(owner, **values):
+            if values.get("delivery_pending") == 1:
+                raise sqlite3.OperationalError("cannot write marker")
+            await original(owner, **values)
+        self.repo.update = fail_marker
+        queued = []
+        self.service.queue = lambda owner, timestamp: queued.append(timestamp)
+        await self.service.deliver(1)
+        self.bot.send_message.assert_not_awaited()
+        self.assertTrue(queued)
+
+    async def test_recovery_commits_completion_without_resending(self):
+        await self.repo.update(1, current_index=1, current_page=3)
+        original = self.repo.update
+        failed = False
+        async def fail_completion(owner, **values):
+            nonlocal failed
+            if values.get("completed") and not failed:
+                failed = True
+                raise sqlite3.OperationalError("failed final commit")
+            await original(owner, **values)
+        self.repo.update = fail_completion
+        await self.service.deliver(1)
+        await self.service.deliver(1)
+        self.bot.send_message.assert_awaited_once()
+        row = await self.repo.get(1)
+        self.assertEqual(row["completed"], 1)
+        self.assertEqual(row["active"], 0)
+
+    async def test_failed_panel_and_ack_never_repeat_successful_send(self):
+        update = self.update(data="media_confirm:abc")
+        update.effective_message.edit_text.side_effect = NetworkError("panel unavailable")
+        update.effective_message.reply_text.side_effect = NetworkError("ack unavailable")
+        context = SimpleNamespace(user_data={"authenticated": True, "pending_media":
+            dict(nonce="abc", target=-123, expires=time.monotonic() + 60, chat_id=1, message_id=42)})
+        await self.handlers.callback(update, context)
+        self.assertNotIn("pending_media", context.user_data)
+        self.bot.copy_message.assert_awaited_once()
+        self.assertIsNone((await self.repo.get(1))["last_error"])
 
     async def test_authentication_does_not_reset_progress(self):
         await self.repo.update(1, current_day=15, current_page=2)
@@ -370,6 +496,27 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_review_debug_does_not_log_telegram_passwords(self):
+        from quran_bot.application import main
+        output = io.StringIO()
+        handler = logging.StreamHandler(output)
+        root = logging.getLogger()
+        previous = root.level
+        loggers = [logging.getLogger(name) for name in ("telegram", "httpx", "httpcore")]
+        levels = [logger.level for logger in loggers]
+        root.addHandler(handler)
+        root.setLevel(logging.DEBUG)
+        app = Mock()
+        app.run_polling.side_effect = lambda **kwargs: logging.getLogger("telegram.ext.Application").debug("Processing update password=private-test-password")
+        try:
+            with patch("quran_bot.application.Config.load", return_value=SimpleNamespace(log_level="DEBUG")), patch("quran_bot.application.build_application", return_value=app):
+                main()
+            self.assertNotIn("private-test-password", output.getvalue())
+        finally:
+            root.removeHandler(handler)
+            root.setLevel(previous)
+            for logger, level in zip(loggers, levels):
+                logger.setLevel(level)
     def test_colored_button_serialization(self):
         payload = button("شروع", "menu_resume", "success").to_dict()
         self.assertEqual(payload["style"], "success")
@@ -398,9 +545,11 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("&lt;b&gt;test&lt;/b&gt;", text)
 
     def test_catalog_loads_existing_order(self):
-        surahs = load_surahs(ROOT / "surah_list.txt")
-        self.assertEqual(surahs[0]["name"], "علق")
-        self.assertGreater(len(surahs), 0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "surahs.txt"
+            path.write_text("علق|597|597\nفاتحه|1|1\n", encoding="utf-8")
+            surahs = load_surahs(path)
+            self.assertEqual([surah["name"] for surah in surahs], ["علق", "فاتحه"])
 
     def test_env_and_relative_paths(self):
         with tempfile.TemporaryDirectory() as directory:

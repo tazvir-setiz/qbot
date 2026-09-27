@@ -60,7 +60,7 @@ def dashboard(row, surahs, timezone, daily=False, notice=None):
     if notice:
         lines.extend([escape(notice), ""])
     lines.extend([
-        f"{'🟢 فعال' if row.get('active') else '⏸ متوقف'}  ·  روز {fa(row.get('current_day') or 1)}",
+        f"{'✅ پایان‌یافته' if row.get('completed') else ('🟢 فعال' if row.get('active') else '⏸ متوقف')}  ·  روز {fa(row.get('current_day') or 1)}",
         f"👥 مقصد: {escape(row.get('destination_title') or str(row.get('destination_id') or 'انتخاب نشده'))}",
         f"📖 سوره: <b>{escape(surah['name']) if surah else 'انتخاب نشده'}</b>",
         f"📄 صفحهٔ بعدی: {fa(row.get('current_page') or '—')}",

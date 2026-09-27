@@ -13,6 +13,7 @@ FIELDS = {
     "next_run": "REAL",
     "destination_id": "INTEGER", "destination_title": "TEXT",
     "last_error": "TEXT", "last_sent_at": "REAL",
+    "completed": "INTEGER DEFAULT 0", "delivery_pending": "INTEGER DEFAULT 0",
 }
 
 

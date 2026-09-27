@@ -1,6 +1,7 @@
 """Persist the next delivery; serialize edits and sends per administrator."""
 import asyncio
 import logging
+import sqlite3
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -27,9 +28,22 @@ class DeliveryService:
         self.scheduler = AsyncIOScheduler(timezone=config.timezone)
         self.locks = defaultdict(asyncio.Lock)
         self.destination = Destination(config, repository, bot)
+        self.pending_updates = {}
+        self.storage_errors = {}
+
+    async def persist_delivery(self, chat_id, **values):
+        # Keep the exact result until SQLite confirms it; never resend to recover a write.
+        self.pending_updates[chat_id] = values
+        await self.flush_pending(chat_id)
+
+    async def flush_pending(self, chat_id):
+        if chat_id in self.pending_updates:
+            await self.repo.update(chat_id, **self.pending_updates[chat_id])
+            self.pending_updates.pop(chat_id)
+        self.storage_errors.pop(chat_id, None)
 
     def ready(self, row):
-        if not row or interval_seconds(row) <= 0:
+        if not row or row.get("completed") or row.get("delivery_pending") or interval_seconds(row) <= 0:
             return False
         index, page = row.get("current_index"), row.get("current_page")
         return (isinstance(index, int) and 0 <= index < len(self.surahs)
@@ -53,6 +67,10 @@ class DeliveryService:
         self.remove(chat_id)
         row = await self.repo.get(chat_id)
         if not row or not row["active"]:
+            return
+        if row.get("delivery_pending"):
+            await self.repo.update(chat_id, active=0, next_run=None,
+                                   last_error="نتیجهٔ ارسال قبلی پس از قطع برنامه نامشخص است؛ گروه را بررسی و صفحهٔ شروع را دوباره انتخاب کنید.")
             return
         if not self.ready(row):
             await self.repo.update(chat_id, active=0, next_run=None,
@@ -89,10 +107,26 @@ class DeliveryService:
             await asyncio.sleep(0)
 
     async def deliver(self, chat_id):
+        try:
+            await self._deliver(chat_id)
+        except sqlite3.Error:
+            self.storage_errors[chat_id] = "خطای ذخیره‌سازی؛ بازیابی اطلاعات در حال تلاش مجدد است."
+            logger.error("Database failure for schedule %s; retrying persistence in 30 seconds", chat_id)
+            self.queue(chat_id, datetime.now(timezone.utc).timestamp() + 30)
+
+    async def _deliver(self, chat_id):
         async with self.locks[chat_id]:
+            if chat_id in self.pending_updates:
+                await self.flush_pending(chat_id)
+                await self.refresh(chat_id)
+                return
             row = await self.repo.get(chat_id)
+            self.storage_errors.pop(chat_id, None)
             if not row or not row["active"]:
                 self.remove(chat_id)
+                return
+            if row.get("delivery_pending"):
+                await self.refresh(chat_id)
                 return
             if not self.ready(row):
                 await self.repo.update(chat_id, active=0, next_run=None,
@@ -106,10 +140,12 @@ class DeliveryService:
                 return
             index, page = row["current_index"], row["current_page"]
             message = build_daily_message(self.surahs[index], page, row["current_day"], self.config.timezone)
+            # Survives a process exit between Telegram delivery and progress commit.
+            await self.repo.update(chat_id, delivery_pending=1)
             try:
                 await self.destination.send(chat_id, message)
             except (BadRequest, Forbidden, ValueError) as exc:
-                await self.repo.update(chat_id, active=0, next_run=None, last_error=error_text(exc))
+                await self.persist_delivery(chat_id, active=0, next_run=None, delivery_pending=0, last_error=error_text(exc))
                 self.remove(chat_id)
                 logger.error("Destination rejected delivery; schedule %s stopped. Check group ID and permissions.", chat_id)
                 await self.notify_failure(chat_id, exc)
@@ -122,12 +158,12 @@ class DeliveryService:
                         delay = delay.total_seconds()
                     delay = max(1, delay) + 1
                 timestamp = datetime.now(timezone.utc).timestamp() + delay
-                await self.repo.update(chat_id, next_run=timestamp, last_error=error_text(exc))
+                await self.persist_delivery(chat_id, next_run=timestamp, delivery_pending=0, last_error=error_text(exc))
                 self.queue(chat_id, timestamp)
                 logger.warning("Delivery deferred for chat %s (%s)", chat_id, type(exc).__name__)
                 return
             except TelegramError as exc:
-                await self.repo.update(chat_id, active=0, next_run=None, last_error=error_text(exc))
+                await self.persist_delivery(chat_id, active=0, next_run=None, delivery_pending=0, last_error=error_text(exc))
                 self.remove(chat_id)
                 logger.error("Telegram rejected delivery; schedule %s stopped", chat_id)
                 await self.notify_failure(chat_id, exc)
@@ -137,15 +173,15 @@ class DeliveryService:
             if page > self.surahs[index]["end_page"]:
                 index += 1
                 if index == len(self.surahs):
-                    await self.repo.update(chat_id, active=0, next_run=None, is_first_message=1,
-                                           last_error=None, last_sent_at=sent_at)
+                    await self.persist_delivery(chat_id, active=0, next_run=None, is_first_message=0,
+                                                last_error=None, last_sent_at=sent_at, completed=1, delivery_pending=0)
                     self.remove(chat_id)
                     return
                 page = self.surahs[index]["start_page"]
             timestamp = datetime.now(timezone.utc).timestamp() + interval_seconds(row)
-            await self.repo.update(chat_id, current_index=index, current_page=page,
+            await self.persist_delivery(chat_id, current_index=index, current_page=page,
                                    current_day=row["current_day"] + 1, is_first_message=0, next_run=timestamp,
-                                   last_error=None, last_sent_at=sent_at)
+                                   last_error=None, last_sent_at=sent_at, delivery_pending=0)
             self.queue(chat_id, timestamp)
 
     async def notify_failure(self, chat_id, exc):

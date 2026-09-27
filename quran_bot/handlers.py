@@ -36,6 +36,8 @@ class Handlers:
         row = await self.repo.get(update.effective_chat.id)
         if row is not None:
             row["destination_id"] = self.service.destination.from_row(row)
+            if update.effective_chat.id in self.service.storage_errors:
+                row.update(active=0, last_error=self.service.storage_errors[update.effective_chat.id])
         await show_menu(update.effective_message, daily=daily, row=row, surahs=self.surahs,
                         timezone=self.config.timezone, edit=edit, notice=notice)
 
@@ -78,6 +80,7 @@ class Handlers:
             await update.effective_message.reply_text("❌ " + error_text(exc))
             return
         async with self.service.locks[owner]:
+            await self.service.flush_pending(owner)
             await self.repo.update(owner, destination_id=chat.id, destination_title=chat.title,
                                    active=0, next_run=None, last_error=None)
             await self.service.refresh(owner)
@@ -153,6 +156,7 @@ class Handlers:
 
     async def change(self, chat_id, **values):
         async with self.service.locks[chat_id]:
+            await self.service.flush_pending(chat_id)
             await self.repo.update(chat_id, **values)
             await self.service.refresh(chat_id)
 
@@ -164,7 +168,7 @@ class Handlers:
         if not surah["start_page"] <= page <= surah["end_page"]:
             raise ValueError("صفحه متعلق به این سوره نیست.")
         await self.change(chat_id, current_index=index, current_page=page, current_day=1,
-                          is_first_message=1, next_run=None)
+                          is_first_message=1, next_run=None, completed=0, delivery_pending=0)
 
     async def message(self, update, context):
         if not self.allowed(update) or not await self.authenticate(update, context):
@@ -278,6 +282,7 @@ class Handlers:
         context.user_data.pop("state", None)
         if not data.startswith("media_confirm:"):
             context.user_data.pop("pending_media", None)
+        sent_to_group = False
         try:
             if data == "menu_group":
                 await self.group_panel(update, edit=True)
@@ -297,6 +302,7 @@ class Handlers:
                     await self.service.destination.check(chat_id)
                     if data == "group_test":
                         await self.service.destination.send(chat_id, "✅ پیام آزمایشی همراه تدبر\nاتصال ربات به این گروه برقرار است.")
+                        sent_to_group = True
                         await self.repo.update(chat_id, last_error=None)
                 await self.group_panel(update, notice="✅ پیام آزمایشی ارسال شد؛ برای ارسال روزانه برنامه را فعال کنید." if data == "group_test" else "✅ گروه در دسترس است و بات اجازهٔ ارسال متن دارد.", edit=True)
             elif data == "menu_choose_start" or data.startswith("surahs:"):
@@ -354,13 +360,21 @@ class Handlers:
                         await self.panel(update, notice="گروه مقصد تغییر کرده؛ پیام را دوباره انتخاب کنید.", edit=True)
                         return
                     await self.service.destination.copy(chat_id, from_chat_id=pending["chat_id"], message_id=pending["message_id"])
+                    sent_to_group = True
                 await self.panel(update, notice="✅ پیام به گروه ارسال شد.", edit=True)
             elif data == "menu_logout":
                 context.user_data.clear()
                 await render(message, "<b>🔒 از پنل خارج شدید</b>\nورود دوباره: /start\nزمان‌بندی‌های فعال ادامه دارند.", edit=True)
             elif data == "menu_resume":
                 async with self.service.locks[chat_id]:
+                    await self.service.flush_pending(chat_id)
                     row = await self.repo.get(chat_id)
+                    if row and row.get("completed"):
+                        await self.panel(update, daily=True, notice="✅ مطالعه پایان یافته است؛ برای شروع دوباره سوره یا صفحه را انتخاب کنید.", edit=True)
+                        return
+                    if row and row.get("delivery_pending"):
+                        await self.panel(update, daily=True, notice="نتیجهٔ ارسال قبلی نامشخص است؛ گروه را بررسی و صفحهٔ شروع را دوباره انتخاب کنید.", edit=True)
+                        return
                     if not self.service.ready(row):
                         await self.panel(update, daily=True, notice="برای شروع، سوره/صفحه، دوره و ساعت را تکمیل کنید.", edit=True)
                         return
@@ -382,10 +396,18 @@ class Handlers:
             elif data == "menu_send_hello":
                 # Retained for buttons sent by older versions.
                 await self.service.destination.send(chat_id, "سلام 👋")
+                sent_to_group = True
                 await self.panel(update, notice="✅ ارسال شد.", edit=True)
             else:
                 await self.panel(update, daily=data == "menu_daily_settings", edit=True)
         except TelegramError as exc:
+            if sent_to_group:
+                logger.warning("Group delivery succeeded; panel update failed (%s)", type(exc).__name__)
+                try:
+                    await message.reply_text("✅ پیام به گروه ارسال شد؛ به‌روزرسانی پنل انجام نشد. برای نمایش وضعیت /menu را بزنید.")
+                except TelegramError:
+                    logger.warning("Could not acknowledge successful group delivery")
+                return
             await self.repo.update(chat_id, last_error=error_text(exc))
             await self.group_panel(update, notice="❌ عملیات انجام نشد: " + error_text(exc), edit=True)
         except ValueError as exc:
