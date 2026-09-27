@@ -10,6 +10,7 @@ from apscheduler.triggers.cron import CronTrigger
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
 
 from .formatting import build_daily_message
+from .destination import Destination, error_text
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,7 @@ class DeliveryService:
         self.config, self.repo, self.surahs, self.bot = config, repository, surahs, bot
         self.scheduler = AsyncIOScheduler(timezone=config.timezone)
         self.locks = defaultdict(asyncio.Lock)
+        self.destination = Destination(config, repository, bot)
 
     def ready(self, row):
         if not row or interval_seconds(row) <= 0:
@@ -53,7 +55,8 @@ class DeliveryService:
         if not row or not row["active"]:
             return
         if not self.ready(row):
-            await self.repo.update(chat_id, active=0, next_run=None)
+            await self.repo.update(chat_id, active=0, next_run=None,
+                                   last_error="تنظیمات برنامه ناقص است؛ سوره، صفحه، دوره و ساعت را بررسی کنید.")
             return
         now = datetime.now(timezone.utc)
         timestamp = row["next_run"]
@@ -88,22 +91,28 @@ class DeliveryService:
     async def deliver(self, chat_id):
         async with self.locks[chat_id]:
             row = await self.repo.get(chat_id)
-            if not row or not row["active"] or not self.ready(row):
+            if not row or not row["active"]:
+                self.remove(chat_id)
+                return
+            if not self.ready(row):
+                await self.repo.update(chat_id, active=0, next_run=None,
+                                       last_error="تنظیمات برنامه ناقص است؛ سوره، صفحه، دوره و ساعت را بررسی کنید.")
                 self.remove(chat_id)
                 return
             # A queued old job may have waited while a user changed its schedule.
             now = datetime.now(timezone.utc).timestamp()
-            if row["next_run"] and row["next_run"] > now + 1:
+            if row["next_run"] and row["next_run"] > now:
                 self.queue(chat_id, row["next_run"])
                 return
             index, page = row["current_index"], row["current_page"]
             message = build_daily_message(self.surahs[index], page, row["current_day"], self.config.timezone)
             try:
-                await self.bot.send_message(chat_id=self.config.group_id, text=message)
-            except (BadRequest, Forbidden):
-                await self.repo.update(chat_id, active=0, next_run=None)
+                await self.destination.send(chat_id, message)
+            except (BadRequest, Forbidden, ValueError) as exc:
+                await self.repo.update(chat_id, active=0, next_run=None, last_error=error_text(exc))
                 self.remove(chat_id)
                 logger.error("Destination rejected delivery; schedule %s stopped. Check group ID and permissions.", chat_id)
+                await self.notify_failure(chat_id, exc)
                 return
             except (NetworkError, RetryAfter) as exc:
                 delay = 60
@@ -113,24 +122,34 @@ class DeliveryService:
                         delay = delay.total_seconds()
                     delay = max(1, delay) + 1
                 timestamp = datetime.now(timezone.utc).timestamp() + delay
-                await self.repo.update(chat_id, next_run=timestamp)
+                await self.repo.update(chat_id, next_run=timestamp, last_error=error_text(exc))
                 self.queue(chat_id, timestamp)
                 logger.warning("Delivery deferred for chat %s (%s)", chat_id, type(exc).__name__)
                 return
-            except TelegramError:
-                await self.repo.update(chat_id, active=0, next_run=None)
+            except TelegramError as exc:
+                await self.repo.update(chat_id, active=0, next_run=None, last_error=error_text(exc))
                 self.remove(chat_id)
                 logger.error("Telegram rejected delivery; schedule %s stopped", chat_id)
+                await self.notify_failure(chat_id, exc)
                 return
+            sent_at = datetime.now(timezone.utc).timestamp()
             page += 1
             if page > self.surahs[index]["end_page"]:
                 index += 1
                 if index == len(self.surahs):
-                    await self.repo.update(chat_id, active=0, next_run=None, is_first_message=1)
+                    await self.repo.update(chat_id, active=0, next_run=None, is_first_message=1,
+                                           last_error=None, last_sent_at=sent_at)
                     self.remove(chat_id)
                     return
                 page = self.surahs[index]["start_page"]
             timestamp = datetime.now(timezone.utc).timestamp() + interval_seconds(row)
             await self.repo.update(chat_id, current_index=index, current_page=page,
-                                   current_day=row["current_day"] + 1, is_first_message=0, next_run=timestamp)
+                                   current_day=row["current_day"] + 1, is_first_message=0, next_run=timestamp,
+                                   last_error=None, last_sent_at=sent_at)
             self.queue(chat_id, timestamp)
+
+    async def notify_failure(self, chat_id, exc):
+        try:
+            await self.bot.send_message(chat_id=chat_id, text="⚠️ ارسال روزانه متوقف شد.\n" + error_text(exc) + "\nتنظیم گروه: /group")
+        except TelegramError:
+            logger.warning("Could not notify owner of failed delivery")

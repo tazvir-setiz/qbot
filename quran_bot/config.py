@@ -28,7 +28,7 @@ def read_env(path: Path) -> dict[str, str]:
 @dataclass(frozen=True)
 class Config:
     token: str
-    group_id: int
+    group_id: int | None
     password: str
     timezone: str
     db_path: Path
@@ -39,7 +39,7 @@ class Config:
     @classmethod
     def load(cls, root: Path = ROOT):
         values = {**read_env(root / ".env"), **os.environ}
-        for key in ("BOT_TOKEN", "GROUP_ID", "ADMIN_PASSWORD"):
+        for key in ("BOT_TOKEN", "ADMIN_PASSWORD"):
             if not values.get(key):
                 raise ValueError(f"Missing required setting: {key}")
         token = values["BOT_TOKEN"]
@@ -50,8 +50,8 @@ class Config:
         level = values.get("LOG_LEVEL", "INFO").upper()
         if level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
             raise ValueError("Invalid LOG_LEVEL")
-        group_id = int(values["GROUP_ID"])
-        if group_id >= 0:
+        group_id = int(values["GROUP_ID"]) if values.get("GROUP_ID") else None
+        if group_id is not None and group_id >= 0:
             raise ValueError("GROUP_ID must be a negative Telegram group ID")
         return cls(token, group_id, values["ADMIN_PASSWORD"], timezone,
                    (root / values.get("DB_PATH", "bot_data.db")).resolve(),

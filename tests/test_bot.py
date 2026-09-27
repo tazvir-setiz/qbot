@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import anyio
-from telegram.error import BadRequest, NetworkError
+from telegram.error import BadRequest, ChatMigrated, NetworkError
 from telegram.request import HTTPXRequest
 
 from quran_bot.application import build_application
@@ -30,7 +30,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.repo = Repository(self.path)
         await self.repo.initialize()
         self.config = SimpleNamespace(group_id=-123, timezone="Asia/Tehran", password="secret", admin_ids=frozenset())
-        self.bot = SimpleNamespace(send_message=AsyncMock())
+        self.bot = SimpleNamespace(send_message=AsyncMock(), copy_message=AsyncMock(), id=123, get_chat=AsyncMock(), get_chat_member=AsyncMock())
+        self.bot.get_chat.return_value = SimpleNamespace(id=-456, title="گروه آزمایش", type="supergroup", permissions=None)
+        self.bot.get_chat_member.return_value = SimpleNamespace(status="administrator")
         self.surahs = [dict(name="الف", start_page=1, end_page=2), dict(name="ب", start_page=3, end_page=3)]
         self.service = DeliveryService(self.config, self.repo, self.surahs, self.bot)
         self.handlers = Handlers(self.config, self.repo, self.service)
@@ -95,6 +97,37 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(self.service.deliver(1), self.service.deliver(1))
         self.bot.send_message.assert_awaited_once()
 
+    async def test_one_second_interval_does_not_send_early_or_duplicate(self):
+        await self.repo.update(1, interval_seconds=1)
+        await asyncio.gather(self.service.deliver(1), self.service.deliver(1))
+        self.bot.send_message.assert_awaited_once()
+        self.assertEqual((await self.repo.get(1))["current_page"], 2)
+
+    async def test_invalid_schedule_is_not_reported_as_active(self):
+        await self.repo.update(1, hour=None)
+        await self.service.deliver(1)
+        row = await self.repo.get(1)
+        self.assertEqual(row["active"], 0)
+        self.assertIsNotNone(row["last_error"])
+        self.bot.send_message.assert_not_awaited()
+
+    async def test_select_group_resume_restart_and_deliver(self):
+        context = SimpleNamespace(user_data={"authenticated": True, "state": "group"})
+        await self.handlers.message(self.update("-456"), context)
+        await self.handlers.callback(self.update(data="menu_resume"), context)
+        row = await self.repo.get(1)
+        self.assertEqual(row["active"], 1)
+        self.assertIsNotNone(row["next_run"])
+        restarted = DeliveryService(self.config, Repository(self.path), self.surahs, self.bot)
+        queued = []
+        restarted.queue = lambda owner, timestamp: queued.append((owner, timestamp))
+        await restarted.refresh(1)
+        self.assertEqual(queued[0][1], row["next_run"])
+        await self.repo.update(1, next_run=time.time() - 1)
+        await restarted.deliver(1)
+        self.assertEqual(self.bot.send_message.call_args.kwargs["chat_id"], -456)
+        self.assertEqual((await self.repo.get(1))["current_page"], 2)
+
     async def test_stopped_schedule_stays_stopped_after_selection(self):
         await self.repo.update(1, active=0)
         await self.handlers.select(1, 1)
@@ -145,6 +178,93 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         update.effective_message.edit_text.assert_awaited_once()
         update.effective_message.reply_text.assert_not_awaited()
 
+    async def test_save_group_persists_and_pauses_existing_schedule(self):
+        context = SimpleNamespace(user_data={"authenticated": True, "state": "group"})
+        await self.handlers.message(self.update("-456"), context)
+        row = await self.repo.get(1)
+        self.assertEqual(row["destination_id"], -456)
+        self.assertEqual(row["active"], 0)
+        self.assertIsNone(row["next_run"])
+        self.assertNotIn("state", context.user_data)
+        self.bot.send_message.assert_not_awaited()
+
+    async def test_invalid_group_keeps_previous_destination(self):
+        await self.repo.update(1, destination_id=-789)
+        self.bot.get_chat.side_effect = BadRequest("Chat not found")
+        context = SimpleNamespace(user_data={"authenticated": True, "state": "group"})
+        await self.handlers.message(self.update("-456"), context)
+        self.assertEqual((await self.repo.get(1))["destination_id"], -789)
+        self.assertEqual(context.user_data["state"], "group")
+
+    async def test_native_group_picker_saves_matching_request_only(self):
+        context = SimpleNamespace(user_data={"authenticated": True, "state": "group", "group_request": 55})
+        update = self.update()
+        update.effective_message.chat_shared = SimpleNamespace(request_id=54, chat_id=-456)
+        await self.handlers.message(update, context)
+        self.assertIsNone((await self.repo.get(1))["destination_id"])
+        update.effective_message.chat_shared.request_id = 55
+        await self.handlers.message(update, context)
+        self.assertEqual((await self.repo.get(1))["destination_id"], -456)
+        self.assertNotIn("group_request", context.user_data)
+
+    async def test_group_cannot_be_changed_without_login(self):
+        context = SimpleNamespace(user_data={"state": "group"})
+        await self.handlers.message(self.update("-456"), context)
+        self.assertIsNone((await self.repo.get(1))["destination_id"])
+        self.bot.get_chat.assert_not_awaited()
+
+    async def test_restricted_bot_cannot_be_selected(self):
+        self.bot.get_chat_member.return_value = SimpleNamespace(status="restricted", is_member=True, can_send_messages=False)
+        context = SimpleNamespace(user_data={"authenticated": True, "state": "group"})
+        await self.handlers.message(self.update("-456"), context)
+        self.assertIsNone((await self.repo.get(1))["destination_id"])
+
+    async def test_scheduled_and_custom_sends_use_saved_group(self):
+        await self.repo.update(1, destination_id=-456)
+        await self.service.deliver(1)
+        self.assertEqual(self.bot.send_message.call_args.kwargs["chat_id"], -456)
+        await self.service.destination.copy(1, 1, 42)
+        self.bot.copy_message.assert_awaited_once_with(chat_id=-456, from_chat_id=1, message_id=42)
+
+    async def test_migrated_group_is_saved_and_retried(self):
+        self.bot.send_message.side_effect = [ChatMigrated(-100456), None]
+        await self.service.deliver(1)
+        row = await self.repo.get(1)
+        self.assertEqual(row["destination_id"], -100456)
+        self.assertEqual(row["current_page"], 2)
+        self.assertEqual(self.bot.send_message.call_args.kwargs["chat_id"], -100456)
+
+    async def test_group_test_sends_without_advancing_reading(self):
+        context = SimpleNamespace(user_data={"authenticated": True})
+        before = await self.repo.get(1)
+        await self.handlers.callback(self.update(data="group_test"), context)
+        row = await self.repo.get(1)
+        self.assertEqual((row["current_page"], row["next_run"]), (before["current_page"], before["next_run"]))
+        self.bot.send_message.assert_awaited_once()
+        self.assertEqual(self.bot.send_message.call_args.kwargs["chat_id"], -456)
+
+    async def test_resume_checks_destination_before_activation(self):
+        await self.repo.update(1, active=0, next_run=None)
+        self.bot.get_chat.side_effect = BadRequest("Chat not found")
+        await self.handlers.callback(self.update(data="menu_resume"), SimpleNamespace(user_data={"authenticated": True}))
+        row = await self.repo.get(1)
+        self.assertEqual(row["active"], 0)
+        self.assertIn("گروه پیدا نشد", row["last_error"])
+
+    async def test_changed_destination_invalidates_pending_media(self):
+        await self.repo.update(1, destination_id=-456)
+        context = SimpleNamespace(user_data={"authenticated": True, "pending_media":
+            dict(nonce="abc", target=-123, expires=time.monotonic() + 60, chat_id=1, message_id=42)})
+        await self.handlers.callback(self.update(data="media_confirm:abc"), context)
+        self.bot.copy_message.assert_not_awaited()
+
+    async def test_permanent_error_records_reason_and_notifies_owner(self):
+        self.bot.send_message.side_effect = [BadRequest("Chat not found"), None]
+        await self.service.deliver(1)
+        row = await self.repo.get(1)
+        self.assertIn("گروه پیدا نشد", row["last_error"])
+        self.assertEqual(self.bot.send_message.call_args.kwargs["chat_id"], 1)
+
     async def test_interval_and_time_presets(self):
         context = SimpleNamespace(user_data={"authenticated": True})
         await self.handlers.callback(self.update(data="interval:daily"), context)
@@ -163,7 +283,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_media_confirmation_is_one_use(self):
         context = SimpleNamespace(user_data={"authenticated": True, "pending_media":
             dict(nonce="abc", expires=time.monotonic() + 60, chat_id=1, message_id=42)},
-            bot=SimpleNamespace(copy_message=AsyncMock()))
+            bot=self.bot)
         await self.handlers.callback(self.update(data="media_confirm:abc"), context)
         await self.handlers.callback(self.update(data="media_confirm:abc"), context)
         context.bot.copy_message.assert_awaited_once_with(chat_id=-123, from_chat_id=1, message_id=42)
@@ -176,7 +296,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             setattr(message, field, None)
         message.message_id = 42
         context = SimpleNamespace(user_data={"authenticated": True, "state": "media"},
-                                  bot=SimpleNamespace(copy_message=AsyncMock()))
+                                  bot=self.bot)
         await self.handlers.message(update, context)
         self.assertEqual(context.user_data["pending_media"]["message_id"], 42)
         self.assertNotIn("state", context.user_data)
@@ -185,7 +305,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancel_invalidates_pending_send(self):
         context = SimpleNamespace(user_data={"authenticated": True, "pending_media":
             dict(nonce="abc", expires=time.monotonic() + 60, chat_id=1, message_id=42)},
-            bot=SimpleNamespace(copy_message=AsyncMock()))
+            bot=self.bot)
         await self.handlers.cancel(self.update(), context)
         await self.handlers.callback(self.update(data="media_confirm:abc"), context)
         context.bot.copy_message.assert_not_awaited()
@@ -201,7 +321,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_expired_media_confirmation_does_not_send(self):
         context = SimpleNamespace(user_data={"authenticated": True, "pending_media":
             dict(nonce="abc", expires=time.monotonic() - 1, chat_id=1, message_id=42)},
-            bot=SimpleNamespace(copy_message=AsyncMock()))
+            bot=self.bot)
         await self.handlers.callback(self.update(data="media_confirm:abc"), context)
         context.bot.copy_message.assert_not_awaited()
 
@@ -290,6 +410,13 @@ class ConfigTests(unittest.TestCase):
                 config = Config.load(root)
             self.assertEqual(config.db_path, root / "bot_data.db")
             self.assertEqual(config.password, "رمز")
+
+    def test_env_group_is_optional(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".env").write_text("BOT_TOKEN=123:fake\nADMIN_PASSWORD=test\n", encoding="utf-8")
+            with patch.dict("os.environ", {}, clear=True):
+                self.assertIsNone(Config.load(root).group_id)
 
     def test_full_polling_lifecycle_without_network(self):
         calls = []

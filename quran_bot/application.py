@@ -23,6 +23,7 @@ def build_application(config):
                 BotCommand("start", "ورود به ربات"), BotCommand("menu", "پنل اصلی"),
                 BotCommand("status", "وضعیت برنامه"), BotCommand("cancel", "لغو ورودی فعلی"),
                 BotCommand("help", "راهنمای استفاده"),
+                BotCommand("group", "انتخاب گروه و آزمایش ارسال"),
             ], scope=BotCommandScopeAllPrivateChats())
             await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
         except TelegramError as exc:
@@ -43,6 +44,7 @@ def build_application(config):
     app.add_handler(CommandHandler("cancel", handlers.cancel, filters=private))
     app.add_handler(CommandHandler(["menu", "status"], handlers.menu, filters=private))
     app.add_handler(CommandHandler("help", handlers.help, filters=private))
+    app.add_handler(CommandHandler("group", handlers.group, filters=private))
     app.add_handler(CallbackQueryHandler(handlers.callback))
     app.add_handler(MessageHandler(private & ~filters.COMMAND, handlers.message))
     app.add_error_handler(handlers.error)

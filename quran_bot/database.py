@@ -11,6 +11,8 @@ FIELDS = {
     "interval_seconds": "INTEGER DEFAULT 0", "hour": "INTEGER", "minute": "INTEGER",
     "is_first_message": "INTEGER DEFAULT 1", "active": "INTEGER DEFAULT 0",
     "next_run": "REAL",
+    "destination_id": "INTEGER", "destination_title": "TEXT",
+    "last_error": "TEXT", "last_sent_at": "REAL",
 }
 
 

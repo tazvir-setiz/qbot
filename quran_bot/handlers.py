@@ -6,9 +6,11 @@ from html import escape
 from datetime import datetime
 
 import pytz
+from telegram import KeyboardButton, KeyboardButtonRequestChat, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.error import Conflict, TelegramError
 
 from .catalog import normalize_name
+from .destination import error_text
 from .formatting import build_daily_message, jalali_now, to_persian_number
 from .menus import (HELP, INTERVALS, TIMES, back_markup, keyboard, presets,
                     preview_markup, render, show_menu, surah_picker)
@@ -32,8 +34,57 @@ class Handlers:
 
     async def panel(self, update, daily=False, notice=None, edit=False):
         row = await self.repo.get(update.effective_chat.id)
+        if row is not None:
+            row["destination_id"] = self.service.destination.from_row(row)
         await show_menu(update.effective_message, daily=daily, row=row, surahs=self.surahs,
                         timezone=self.config.timezone, edit=edit, notice=notice)
+
+    async def clear_group_picker(self, update, context):
+        if context.user_data.pop("group_request", None) is not None:
+            await update.effective_message.reply_text("انتخاب گروه بسته شد.", reply_markup=ReplyKeyboardRemove())
+
+    async def group(self, update, context):
+        if not self.allowed(update):
+            return
+        if not context.user_data.get("authenticated"):
+            await update.effective_message.reply_text("برای تنظیم گروه ابتدا /start را بزنید و وارد شوید.")
+            return
+        await self.clear_group_picker(update, context)
+        context.user_data.pop("state", None)
+        context.user_data.pop("pending_media", None)
+        await self.group_panel(update)
+
+    async def group_panel(self, update, notice=None, edit=False):
+        row = await self.repo.get(update.effective_chat.id) or {}
+        target = self.service.destination.from_row(row)
+        title = row.get("destination_title") or "نام گروه هنوز بررسی نشده"
+        text = ("<b>👥 گروه مقصد</b>\n\n" + escape(title) + "\nشناسه: <code>" + str(target or "تنظیم نشده") + "</code>"
+                + "\n\n۱. بات را به گروه اضافه کنید و اجازهٔ ارسال بدهید.\n۲. گروه را انتخاب کنید یا شناسهٔ منفی / @username گروه عمومی را بنویسید."
+                + "\n۳. «ارسال آزمایشی» را بزنید و سپس برنامهٔ مطالعه را فعال کنید.")
+        if notice:
+            text += "\n\n" + escape(notice)
+        if row.get("last_error"):
+            text += "\n\n⚠️ آخرین خطا: " + escape(row["last_error"])
+        await render(update.effective_message, text, keyboard([
+            ("👥 انتخاب گروه", "group_choose", "primary"), ("✍️ ورود شناسه", "group_manual"),
+            ("🔎 بررسی دسترسی", "group_check"), ("📨 ارسال آزمایشی", "group_test", "success"),
+            ("⚙️ برنامهٔ مطالعه", "menu_daily_settings"), ("‹ خانه", "menu_back")], 2), edit=edit)
+
+    async def save_group(self, update, context, target):
+        owner = update.effective_chat.id
+        try:
+            chat = await self.service.destination.validate(target)
+        except (TelegramError, ValueError) as exc:
+            await update.effective_message.reply_text("❌ " + error_text(exc))
+            return
+        async with self.service.locks[owner]:
+            await self.repo.update(owner, destination_id=chat.id, destination_title=chat.title,
+                                   active=0, next_run=None, last_error=None)
+            await self.service.refresh(owner)
+        context.user_data.pop("state", None)
+        context.user_data.pop("pending_media", None)
+        await self.clear_group_picker(update, context)
+        await self.group_panel(update, notice="✅ گروه ذخیره شد. ارسال زمان‌بندی‌شده متوقف است؛ پس از آزمایش، «شروع ارسال» را بزنید.")
 
     async def menu(self, update, context):
         if not self.allowed(update):
@@ -41,6 +92,7 @@ class Handlers:
         if not context.user_data.get("authenticated"):
             await update.effective_message.reply_text("🔑 برای ورود /start را بزنید.")
             return
+        await self.clear_group_picker(update, context)
         context.user_data.pop("state", None)
         context.user_data.pop("pending_media", None)
         await self.panel(update)
@@ -67,6 +119,7 @@ class Handlers:
     async def cancel(self, update, context):
         if not self.allowed(update):
             return
+        await self.clear_group_picker(update, context)
         context.user_data.pop("state", None)
         context.user_data.pop("pending_media", None)
         if context.user_data.get("authenticated"):
@@ -120,8 +173,21 @@ class Handlers:
         chat_id = update.effective_chat.id
         text = (message.text or "").strip()
         state = context.user_data.get("state")
+        shared = getattr(message, "chat_shared", None)
+        if shared:
+            if state == "group" and shared.request_id == context.user_data.get("group_request"):
+                await self.save_group(update, context, shared.chat_id)
+            else:
+                await message.reply_text("این انتخاب گروه منقضی شده است؛ دوباره /group را بزنید.")
+            return
         try:
-            if state == "interval":
+            if state == "group":
+                target = text if text.startswith("@") else int(text)
+                if isinstance(target, int) and target >= 0:
+                    raise ValueError
+                await self.save_group(update, context, target)
+                return
+            elif state == "interval":
                 parts = text.split(":")
                 if len(parts) != 4:
                     raise ValueError("فرمت صحیح: روز:ساعت:دقیقه:ثانیه")
@@ -175,8 +241,13 @@ class Handlers:
                     await message.reply_text("لطفاً رسانه‌ها را تکی بفرستید؛ ارسال آلبوم در این بخش پشتیبانی نمی‌شود.")
                     return
                 nonce = secrets.token_hex(8)
+                try:
+                    target = await self.service.destination.get(chat_id)
+                except ValueError as exc:
+                    await self.group_panel(update, notice=error_text(exc))
+                    return
                 context.user_data["pending_media"] = dict(nonce=nonce, message_id=message.message_id,
-                    chat_id=chat_id, expires=time.monotonic() + 600)
+                    chat_id=chat_id, target=target, expires=time.monotonic() + 600)
                 context.user_data.pop("state", None)
                 await render(message, "<b>✉️ آمادهٔ ارسال</b>\nهمین پیام شما به گروه مقصد ارسال شود؟\nاین تأیید تا ۱۰ دقیقه معتبر است.",
                              keyboard([("ارسال به گروه", f"media_confirm:{nonce}", "success"), ("لغو", "menu_back")], 2))
@@ -203,11 +274,32 @@ class Handlers:
         chat_id = update.effective_chat.id
         if data == "noop":
             return
+        await self.clear_group_picker(update, context)
         context.user_data.pop("state", None)
         if not data.startswith("media_confirm:"):
             context.user_data.pop("pending_media", None)
         try:
-            if data == "menu_choose_start" or data.startswith("surahs:"):
+            if data == "menu_group":
+                await self.group_panel(update, edit=True)
+            elif data in ("group_choose", "group_manual"):
+                context.user_data["state"] = "group"
+                if data == "group_choose":
+                    request_id = secrets.randbelow(2**31)
+                    context.user_data["group_request"] = request_id
+                    markup = ReplyKeyboardMarkup([[KeyboardButton("👥 انتخاب گروه مقصد", request_chat=KeyboardButtonRequestChat(
+                        request_id=request_id, chat_is_channel=False, bot_is_member=True, request_title=True))]],
+                        resize_keyboard=True, one_time_keyboard=True, input_field_placeholder="گروه را انتخاب کنید یا شناسه بفرستید")
+                    await message.reply_text("از دکمهٔ پایین گروه را انتخاب کنید. ابتدا بات باید عضو گروه باشد.\nورود دستی: شناسهٔ منفی یا @username گروه عمومی\nلغو: /cancel", reply_markup=markup)
+                else:
+                    await render(message, "<b>✍️ شناسهٔ گروه</b>\nشناسهٔ عددی منفی (مثل <code>-1001234567890</code>) یا @username گروه عمومی را بفرستید.\nلینک دعوت خصوصی قابل استفاده نیست.\nلغو: /cancel", keyboard([("‹ گروه مقصد", "menu_group")]), edit=True)
+            elif data in ("group_check", "group_test"):
+                async with self.service.locks[chat_id]:
+                    await self.service.destination.check(chat_id)
+                    if data == "group_test":
+                        await self.service.destination.send(chat_id, "✅ پیام آزمایشی همراه تدبر\nاتصال ربات به این گروه برقرار است.")
+                        await self.repo.update(chat_id, last_error=None)
+                await self.group_panel(update, notice="✅ پیام آزمایشی ارسال شد؛ برای ارسال روزانه برنامه را فعال کنید." if data == "group_test" else "✅ گروه در دسترس است و بات اجازهٔ ارسال متن دارد.", edit=True)
+            elif data == "menu_choose_start" or data.startswith("surahs:"):
                 page = 0 if data == "menu_choose_start" else int(data.split(":")[1])
                 text, markup = surah_picker(self.surahs, page)
                 await render(message, text, markup, edit=True)
@@ -256,7 +348,12 @@ class Handlers:
                     return
                 # Consume before sending: duplicate clicks and uncertain network responses must not resend.
                 context.user_data.pop("pending_media", None)
-                await context.bot.copy_message(chat_id=self.config.group_id, from_chat_id=pending["chat_id"], message_id=pending["message_id"])
+                async with self.service.locks[chat_id]:
+                    target = await self.service.destination.get(chat_id)
+                    if pending.get("target", target) != target:
+                        await self.panel(update, notice="گروه مقصد تغییر کرده؛ پیام را دوباره انتخاب کنید.", edit=True)
+                        return
+                    await self.service.destination.copy(chat_id, from_chat_id=pending["chat_id"], message_id=pending["message_id"])
                 await self.panel(update, notice="✅ پیام به گروه ارسال شد.", edit=True)
             elif data == "menu_logout":
                 context.user_data.clear()
@@ -267,8 +364,9 @@ class Handlers:
                     if not self.service.ready(row):
                         await self.panel(update, daily=True, notice="برای شروع، سوره/صفحه، دوره و ساعت را تکمیل کنید.", edit=True)
                         return
+                    await self.service.destination.check(chat_id)
                     if not row["active"]:
-                        await self.repo.update(chat_id, active=1, next_run=None, is_first_message=1)
+                        await self.repo.update(chat_id, active=1, next_run=None, is_first_message=1, last_error=None)
                         await self.service.refresh(chat_id)
                 await self.panel(update, daily=True, notice="▶️ ارسال فعال است.", edit=True)
             elif data == "menu_stop":
@@ -283,11 +381,19 @@ class Handlers:
                 await render(message, HELP, keyboard([("‹ خانه", "menu_back")]), edit=True)
             elif data == "menu_send_hello":
                 # Retained for buttons sent by older versions.
-                await context.bot.send_message(chat_id=self.config.group_id, text="سلام 👋")
+                await self.service.destination.send(chat_id, "سلام 👋")
                 await self.panel(update, notice="✅ ارسال شد.", edit=True)
             else:
                 await self.panel(update, daily=data == "menu_daily_settings", edit=True)
-        except (ValueError, KeyError):
+        except TelegramError as exc:
+            await self.repo.update(chat_id, last_error=error_text(exc))
+            await self.group_panel(update, notice="❌ عملیات انجام نشد: " + error_text(exc), edit=True)
+        except ValueError as exc:
+            if data.startswith("group_") or data in ("menu_resume", "menu_send_hello") or data.startswith("media_confirm:"):
+                await self.group_panel(update, notice="❌ " + error_text(exc), edit=True)
+            else:
+                await self.panel(update, daily=True, notice="گزینه نامعتبر است؛ دوباره از منو انتخاب کنید.", edit=True)
+        except KeyError:
             await self.panel(update, daily=True, notice="گزینه نامعتبر است؛ دوباره از منو انتخاب کنید.", edit=True)
 
     async def error(self, update, context):

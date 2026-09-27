@@ -61,11 +61,17 @@ def dashboard(row, surahs, timezone, daily=False, notice=None):
         lines.extend([escape(notice), ""])
     lines.extend([
         f"{'🟢 فعال' if row.get('active') else '⏸ متوقف'}  ·  روز {fa(row.get('current_day') or 1)}",
+        f"👥 مقصد: {escape(row.get('destination_title') or str(row.get('destination_id') or 'انتخاب نشده'))}",
         f"📖 سوره: <b>{escape(surah['name']) if surah else 'انتخاب نشده'}</b>",
         f"📄 صفحهٔ بعدی: {fa(row.get('current_page') or '—')}",
         f"🔁 هر {duration(row)}" if any(row.get(k) for k in ('interval_days', 'interval_hours', 'interval_minutes', 'interval_seconds')) else "🔁 دوره: تنظیم نشده",
         f"⏰ ساعت شروع: {clock}", f"🗓 ارسال بعدی: {next_time}",
     ])
+    if row.get("last_error"):
+        lines.extend(["", "⚠️ " + escape(row["last_error"])])
+    if row.get("last_sent_at"):
+        sent = datetime.fromtimestamp(row["last_sent_at"], pytz.timezone(timezone))
+        lines.append("✅ آخرین ارسال روزانه: " + fa(jdatetime.datetime.fromgregorian(datetime=sent).strftime("%Y/%m/%d · %H:%M")))
     if selected:
         total = surah['end_page'] - surah['start_page'] + 1
         done = max(0, min(total, (row.get('current_page') or surah['start_page']) - surah['start_page']))
@@ -85,12 +91,12 @@ async def show_menu(message, daily=False, *, row=None, surahs=(), timezone="Asia
         items = [("📖 انتخاب سوره", "menu_choose_start"), ("📄 انتخاب صفحه", "menu_choose_page"),
                  ("🔁 دورهٔ ارسال", "menu_set_interval"), ("⏰ ساعت شروع", "menu_set_time"),
                  ("📅 شمارهٔ روز", "menu_set_day"), ("👁 پیش‌نمایش", "menu_preview"),
-                 toggle, ("‹ خانه", "menu_back")]
+                 ("👥 تنظیم گروه", "menu_group", "primary"), toggle, ("‹ خانه", "menu_back")]
     else:
         items = [("⚙️ برنامهٔ مطالعه", "menu_daily_settings", "primary"), ("👁 پیش‌نمایش", "menu_preview"),
                  ("✉️ ارسال پیام", "menu_send_custom"), ("🔄 تازه‌سازی", "menu_status"),
                  toggle, ("📅 تاریخ و ساعت", "menu_show_time"),
-                 ("❔ راهنما", "menu_help"), ("🔒 خروج", "menu_logout")]
+                 ("👥 تنظیم گروه", "menu_group", "primary"), ("❔ راهنما", "menu_help"), ("🔒 خروج", "menu_logout")]
     return await render(message, dashboard(row, surahs, timezone, daily, notice), keyboard(items, 2), edit=edit)
 
 
@@ -139,6 +145,7 @@ def preview_markup(text):
 
 HELP = """<b>🌿 راهنمای همراه تدبر</b>
 
+<b>ابتدا:</b> از «تنظیم گروه» مقصد را انتخاب کنید و یک پیام آزمایشی بفرستید.
 <b>۱.</b> سوره یا صفحهٔ شروع را انتخاب کنید.
 <b>۲.</b> فاصلهٔ پیام‌ها و ساعت اولین ارسال را تعیین کنید.
 <b>۳.</b> پیش‌نمایش را ببینید و «شروع ارسال» را بزنید.
@@ -149,5 +156,5 @@ HELP = """<b>🌿 راهنمای همراه تدبر</b>
 خروج از حساب، زمان‌بندی را متوقف نمی‌کند.
 ارسال پیام دلخواه پس از تأیید شما انجام می‌شود.</blockquote>
 
-/menu خانه · /status وضعیت
+/group تنظیم گروه · /menu خانه · /status وضعیت
 /cancel لغو ورودی · /help راهنما"""
