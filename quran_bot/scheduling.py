@@ -30,6 +30,23 @@ class DeliveryService:
         self.destination = Destination(config, repository, bot)
         self.pending_updates = {}
         self.storage_errors = {}
+        self.catalog_lock = asyncio.Lock()
+        self.catalog_revision = 0
+
+    async def replace_catalog_locked(self, updated, expected_revision):
+        """Caller holds catalog_lock, shared with handlers and scheduled delivery."""
+        from .catalog import validate_replacement
+        validate_replacement(updated, self.surahs)
+        if expected_revision != self.catalog_revision:
+            raise ValueError("فهرست تغییر کرده؛ فایل را دوباره ارسال کنید.")
+        for owner in list(self.pending_updates):
+            await self.flush_pending(owner)
+        revision = await self.repo.replace_catalog(self.surahs, updated, expected_revision)
+        self.surahs[:] = updated
+        self.catalog_revision = revision
+        for job in self.scheduler.get_jobs():
+            if job.id.startswith("daily_"):
+                self.scheduler.remove_job(job.id)
 
     async def persist_delivery(self, chat_id, **values):
         # Keep the exact result until SQLite confirms it; never resend to recover a write.
@@ -115,7 +132,7 @@ class DeliveryService:
             self.queue(chat_id, datetime.now(timezone.utc).timestamp() + 30)
 
     async def _deliver(self, chat_id):
-        async with self.locks[chat_id]:
+        async with self.catalog_lock, self.locks[chat_id]:
             if chat_id in self.pending_updates:
                 await self.flush_pending(chat_id)
                 await self.refresh(chat_id)

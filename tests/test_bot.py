@@ -17,7 +17,7 @@ from telegram.error import BadRequest, ChatMigrated, NetworkError
 from telegram.request import HTTPXRequest
 
 from quran_bot.application import build_application
-from quran_bot.catalog import load_surahs
+from quran_bot.catalog import load_surahs, parse_surahs
 from quran_bot.config import Config, ROOT
 from quran_bot.database import Repository
 from quran_bot.handlers import Handlers
@@ -442,7 +442,100 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.handlers.message(update, context)
         self.assertEqual(context.user_data["state"], "surah")
         markup = update.effective_message.reply_text.call_args.kwargs["reply_markup"]
-        self.assertEqual(markup.inline_keyboard[0][0].callback_data, "surah_pick:0")
+        self.assertEqual(markup.inline_keyboard[0][0].callback_data, "surah_pick:0:0")
+
+    def upload(self, content):
+        update = self.update()
+        file = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(content)))
+        update.effective_message.document = SimpleNamespace(file_name="list.txt", file_size=len(content), get_file=AsyncMock(return_value=file))
+        return update
+
+    async def test_catalog_upload_requires_confirmation_and_remaps_progress(self):
+        await self.repo.update(1, current_day=9)
+        context = SimpleNamespace(user_data={"authenticated": True, "state": "catalog_upload"})
+        await self.handlers.message(self.upload("ب|3|3\nالف|1|2\n".encode()), context)
+        self.assertIsNone(await self.repo.get_catalog())
+        nonce = context.user_data["pending_catalog"]["nonce"]
+        await self.handlers.callback(self.update(data=f"catalog_confirm:{nonce}"), context)
+        row = await self.repo.get(1)
+        self.assertEqual((row["current_index"], row["current_page"], row["current_day"]), (1, 1, 9))
+        self.assertEqual(row["active"], 0)
+        self.assertIsNone(row["next_run"])
+        self.assertEqual(self.handlers.surahs[0]["name"], "ب")
+        self.assertEqual((await self.repo.get_catalog())[1], 1)
+        self.bot.send_message.assert_not_awaited()
+
+    async def test_catalog_changed_range_resets_page_and_day(self):
+        await self.repo.update(1, current_day=9)
+        async with self.service.catalog_lock:
+            await self.service.replace_catalog_locked(parse_surahs("الف|10|12\nب|3|3"), 0)
+        row = await self.repo.get(1)
+        self.assertEqual((row["current_page"], row["current_day"]), (10, 1))
+
+    async def test_catalog_cancel_invalidates_confirmation(self):
+        context = SimpleNamespace(user_data={"authenticated": True, "state": "catalog_upload"})
+        await self.handlers.message(self.upload("ب|3|3\nالف|1|2".encode()), context)
+        nonce = context.user_data["pending_catalog"]["nonce"]
+        await self.handlers.cancel(self.update(), context)
+        await self.handlers.callback(self.update(data=f"catalog_confirm:{nonce}"), context)
+        self.assertIsNone(await self.repo.get_catalog())
+
+    async def test_catalog_stale_keyboard_cannot_select_wrong_surah(self):
+        async with self.service.catalog_lock:
+            await self.service.replace_catalog_locked(list(reversed(self.surahs)), 0)
+        await self.handlers.callback(self.update(data="surah_pick:0:0"), SimpleNamespace(user_data={"authenticated": True}))
+        self.assertEqual((await self.repo.get(1))["current_index"], 1)
+
+    async def test_catalog_rejects_invalid_and_incomplete_upload(self):
+        for content in ("الف|1|2", "الف|2|1\nب|3|3", "الف|1|2\nالف|3|3"):
+            context = SimpleNamespace(user_data={"authenticated": True, "state": "catalog_upload"})
+            await self.handlers.message(self.upload(content.encode()), context)
+            self.assertNotIn("pending_catalog", context.user_data)
+        self.assertIsNone(await self.repo.get_catalog())
+
+    async def test_catalog_oversize_is_not_downloaded(self):
+        update = self.upload(b"sample")
+        update.effective_message.document.file_size = 65537
+        await self.handlers.message(update, SimpleNamespace(user_data={"authenticated": True, "state": "catalog_upload"}))
+        update.effective_message.document.get_file.assert_not_awaited()
+
+    async def test_catalog_upload_needs_authentication(self):
+        update = self.upload("الف|1|2\nب|3|3".encode())
+        await self.handlers.message(update, SimpleNamespace(user_data={"state": "catalog_upload"}))
+        update.effective_message.document.get_file.assert_not_awaited()
+
+    async def test_catalog_rejects_stale_preview(self):
+        async with self.service.catalog_lock:
+            await self.service.replace_catalog_locked(list(self.surahs), 0)
+            with self.assertRaises(ValueError):
+                await self.service.replace_catalog_locked(list(reversed(self.surahs)), 0)
+        self.assertEqual((await self.repo.get_catalog())[1], 1)
+
+    async def test_catalog_transaction_rolls_back_on_storage_failure(self):
+        before = await self.repo.get(1)
+        async with self.repo.connection() as db:
+            await db.execute("CREATE TRIGGER fail_catalog BEFORE INSERT ON catalog BEGIN SELECT RAISE(ABORT, 'test failure'); END")
+            await db.commit()
+        with self.assertRaises(sqlite3.IntegrityError):
+            async with self.service.catalog_lock:
+                await self.service.replace_catalog_locked(list(reversed(self.surahs)), 0)
+        self.assertEqual(await self.repo.get(1), before)
+        self.assertIsNone(await self.repo.get_catalog())
+        self.assertEqual(self.surahs[0]["name"], "الف")
+
+    async def test_catalog_restart_uses_persisted_catalog(self):
+        async with self.service.catalog_lock:
+            await self.service.replace_catalog_locked(list(reversed(self.surahs)), 0)
+        config = Config("123:fake", -123, "secret", "Asia/Tehran", self.path,
+                        Path(self.temp.name) / "missing-catalog.txt", frozenset())
+        app = build_application(config)
+        with patch.object(type(app.bot), "set_my_commands", new=AsyncMock()), patch.object(type(app.bot), "set_chat_menu_button", new=AsyncMock()):
+            try:
+                await app.post_init(app)
+                self.assertEqual(app.bot_data["service"].surahs[0]["name"], "ب")
+                self.assertEqual(app.bot_data["service"].catalog_revision, 1)
+            finally:
+                await app.post_shutdown(app)
 
     async def test_expired_media_confirmation_does_not_send(self):
         context = SimpleNamespace(user_data={"authenticated": True, "pending_media":

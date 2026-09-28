@@ -14,10 +14,15 @@ from .scheduling import DeliveryService
 
 def build_application(config):
     repo = Repository(config.db_path)
-    surahs = load_surahs(config.surah_path)
+    surahs = []
 
     async def startup(app):
         await repo.initialize()
+        stored = await repo.get_catalog()
+        if stored:
+            surahs[:], service.catalog_revision = stored
+        else:
+            surahs[:] = load_surahs(config.surah_path)
         try:
             await app.bot.set_my_commands([
                 BotCommand("start", "ورود به ربات"), BotCommand("menu", "پنل اصلی"),

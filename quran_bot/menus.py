@@ -55,7 +55,7 @@ def dashboard(row, surahs, timezone, daily=False, notice=None):
     if row.get("next_run"):
         date = datetime.fromtimestamp(row["next_run"], pytz.timezone(timezone))
         next_time = fa(jdatetime.datetime.fromgregorian(datetime=date).strftime("%Y/%m/%d · %H:%M"))
-    title = "⚙️ برنامهٔ مطالعه" if daily else "🌿 همراه تدبر"
+    title = "⚙️ برنامهٔ مطالعه" if daily else "🌿 مُرسِل پیام"
     lines = [f"<b>{title}</b>", "<i>هر روز، یک قدم با قرآن</i>", ""]
     if notice:
         lines.extend([escape(notice), ""])
@@ -91,7 +91,8 @@ async def show_menu(message, daily=False, *, row=None, surahs=(), timezone="Asia
         items = [("📖 انتخاب سوره", "menu_choose_start"), ("📄 انتخاب صفحه", "menu_choose_page"),
                  ("🔁 دورهٔ ارسال", "menu_set_interval"), ("⏰ ساعت شروع", "menu_set_time"),
                  ("📅 شمارهٔ روز", "menu_set_day"), ("👁 پیش‌نمایش", "menu_preview"),
-                 ("👥 تنظیم گروه", "menu_group", "primary"), toggle, ("‹ خانه", "menu_back")]
+                 ("👥 تنظیم گروه", "menu_group", "primary"), toggle,
+                 ("📂 بارگذاری فهرست سوره‌ها", "menu_catalog"), ("‹ خانه", "menu_back")]
     else:
         items = [("⚙️ برنامهٔ مطالعه", "menu_daily_settings", "primary"), ("👁 پیش‌نمایش", "menu_preview"),
                  ("✉️ ارسال پیام", "menu_send_custom"), ("🔄 تازه‌سازی", "menu_status"),
@@ -100,14 +101,13 @@ async def show_menu(message, daily=False, *, row=None, surahs=(), timezone="Asia
     return await render(message, dashboard(row, surahs, timezone, daily, notice), keyboard(items, 2), edit=edit)
 
 
-def surah_picker(surahs, page):
+def surah_picker(surahs, page, revision=0):
     size = 12
     pages = max(1, (len(surahs) + size - 1) // size)
     if not 0 <= page < pages:
         raise ValueError("Invalid surah page")
-    # Display in mushaf order without changing persistent catalog indices.
-    ordered = sorted(enumerate(surahs), key=lambda item: (item[1]['start_page'], item[0]))
-    items = [(surah['name'], f"surah_pick:{index}") for index, surah in ordered[page * size:(page + 1) * size]]
+    ordered = list(enumerate(surahs))
+    items = [(surah['name'], f"surah_pick:{index}:{revision}") for index, surah in ordered[page * size:(page + 1) * size]]
     rows = list(keyboard(items, 2).inline_keyboard)
     navigation = []
     if page:
@@ -116,7 +116,7 @@ def surah_picker(surahs, page):
     if page + 1 < pages:
         navigation.append(button("بعدی ›", f"surahs:{page + 1}"))
     rows.extend([navigation, [button("🔎 جست‌وجوی نام", "surah_search"), button("‹ تنظیمات", "menu_daily_settings")]])
-    return "<b>📖 سورهٔ شروع را انتخاب کنید</b>\nفهرست بر اساس صفحه‌های قرآن مرتب شده است.", InlineKeyboardMarkup(rows)
+    return "<b>📖 سورهٔ شروع را انتخاب کنید</b>\nترتیب نمایش همان ترتیب مطالعه در فهرست فعلی است.", InlineKeyboardMarkup(rows)
 
 
 INTERVALS = {"daily": (1, 0, 0, 0), "twodays": (2, 0, 0, 0), "weekly": (7, 0, 0, 0), "hourly": (0, 1, 0, 0)}
@@ -143,7 +143,7 @@ def preview_markup(text):
     return InlineKeyboardMarkup(rows)
 
 
-HELP = """<b>🌿 راهنمای همراه تدبر</b>
+HELP = """<b>🌿 راهنمای مُرسِل پیام</b>
 
 <b>ابتدا:</b> از «تنظیم گروه» مقصد را انتخاب کنید و یک پیام آزمایشی بفرستید.
 <b>۱.</b> سوره یا صفحهٔ شروع را انتخاب کنید.

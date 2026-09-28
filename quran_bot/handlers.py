@@ -10,6 +10,7 @@ from telegram import KeyboardButton, KeyboardButtonRequestChat, ReplyKeyboardMar
 from telegram.error import Conflict, TelegramError
 
 from .catalog import normalize_name
+from .catalog_upload import CatalogUpload
 from .destination import error_text
 from .formatting import build_daily_message, jalali_now, to_persian_number
 from .menus import (HELP, INTERVALS, TIMES, back_markup, keyboard, presets,
@@ -31,6 +32,11 @@ class Handlers:
         self.config, self.repo, self.service = config, repo, service
         self.surahs = service.surahs
         self.attempts = {}
+        self.catalog_upload = CatalogUpload(self)
+
+    def validate_catalog_button(self, revision):
+        if int(revision) != self.service.catalog_revision:
+            raise ValueError("فهرست تغییر کرده؛ دوباره از منوی جدید سوره را انتخاب کنید.")
 
     async def panel(self, update, daily=False, notice=None, edit=False):
         row = await self.repo.get(update.effective_chat.id)
@@ -46,6 +52,7 @@ class Handlers:
             await update.effective_message.reply_text("انتخاب گروه بسته شد.", reply_markup=ReplyKeyboardRemove())
 
     async def group(self, update, context):
+        context.user_data.pop("pending_catalog", None)
         if not self.allowed(update):
             return
         if not context.user_data.get("authenticated"):
@@ -90,6 +97,7 @@ class Handlers:
         await self.group_panel(update, notice="✅ گروه ذخیره شد. ارسال زمان‌بندی‌شده متوقف است؛ پس از آزمایش، «شروع ارسال» را بزنید.")
 
     async def menu(self, update, context):
+        context.user_data.pop("pending_catalog", None)
         if not self.allowed(update):
             return
         if not context.user_data.get("authenticated"):
@@ -117,9 +125,10 @@ class Handlers:
             return
         context.user_data.clear()
         await self.repo.ensure(update.effective_chat.id)
-        await render(update.effective_message, "<b>🌿 به همراه تدبر خوش آمدید</b>\nهر روز، یک قدم با قرآن\n\n🔑 برای ورود به پنل مدیریت، رمز را بنویسید.")
+        await render(update.effective_message, "<b>🌿 به مُرسِل پیام خوش آمدید</b>\nهر روز، یک قدم با قرآن\n\n🔑 برای ورود به پنل مدیریت، رمز را بنویسید.")
 
     async def cancel(self, update, context):
+        context.user_data.pop("pending_catalog", None)
         if not self.allowed(update):
             return
         await self.clear_group_picker(update, context)
@@ -171,12 +180,19 @@ class Handlers:
                           is_first_message=1, next_run=None, completed=0, delivery_pending=0)
 
     async def message(self, update, context):
+        async with self.service.catalog_lock:
+            await self._message(update, context)
+
+    async def _message(self, update, context):
         if not self.allowed(update) or not await self.authenticate(update, context):
             return
         message = update.effective_message
         chat_id = update.effective_chat.id
         text = (message.text or "").strip()
         state = context.user_data.get("state")
+        if state == "catalog_upload":
+            await self.catalog_upload.receive(update, context)
+            return
         shared = getattr(message, "chat_shared", None)
         if shared:
             if state == "group" and shared.request_id == context.user_data.get("group_request"):
@@ -220,7 +236,7 @@ class Handlers:
                     raise ValueError("صفحه‌ای در فهرست پیدا نشد.")
                 if len(indices) > 1:
                     await message.reply_text("سوره را انتخاب کنید:", reply_markup=keyboard([
-                        (self.surahs[i]["name"], f"select_surah_page_{page}_{i}") for i in indices]))
+                        (self.surahs[i]["name"], f"select_surah_page_{page}_{i}_{self.service.catalog_revision}") for i in indices]))
                     context.user_data.pop("state", None)
                     return
                 await self.select(chat_id, indices[0], page)
@@ -228,7 +244,7 @@ class Handlers:
                 index = next((i for i, s in enumerate(self.surahs) if normalize_name(s["name"]) == normalize_name(text)), None)
                 if index is None:
                     search = normalize_name(text)
-                    matches = [(s["name"], f"surah_pick:{i}") for i, s in enumerate(self.surahs)
+                    matches = [(s["name"], f"surah_pick:{i}:{self.service.catalog_revision}") for i, s in enumerate(self.surahs)
                                if search and search in normalize_name(s["name"])]
                     if matches and len(matches) <= 12:
                         await render(message, "<b>🔎 نتیجهٔ جست‌وجو</b>\nسوره را انتخاب کنید یا نام دقیق‌تری بنویسید.",
@@ -266,6 +282,10 @@ class Handlers:
         await self.panel(update, daily=True, notice="✅ تنظیمات ذخیره شد.")
 
     async def callback(self, update, context):
+        async with self.service.catalog_lock:
+            await self._callback(update, context)
+
+    async def _callback(self, update, context):
         query = update.callback_query
         if not self.allowed(update):
             await query.answer("دسترسی مجاز نیست.", show_alert=True)
@@ -282,9 +302,13 @@ class Handlers:
         context.user_data.pop("state", None)
         if not data.startswith("media_confirm:"):
             context.user_data.pop("pending_media", None)
+        if not data.startswith("catalog_confirm:"):
+            context.user_data.pop("pending_catalog", None)
         sent_to_group = False
         try:
-            if data == "menu_group":
+            if data == "menu_catalog" or data.startswith("catalog_"):
+                await self.catalog_upload.callback(update, context, data)
+            elif data == "menu_group":
                 await self.group_panel(update, edit=True)
             elif data in ("group_choose", "group_manual"):
                 context.user_data["state"] = "group"
@@ -301,15 +325,17 @@ class Handlers:
                 async with self.service.locks[chat_id]:
                     await self.service.destination.check(chat_id)
                     if data == "group_test":
-                        await self.service.destination.send(chat_id, "✅ پیام آزمایشی همراه تدبر\nاتصال ربات به این گروه برقرار است.")
+                        await self.service.destination.send(chat_id, "✅ پیام آزمایشی مُرسِل پیام\nاتصال ربات به این گروه برقرار است.")
                         sent_to_group = True
                         await self.repo.update(chat_id, last_error=None)
                 await self.group_panel(update, notice="✅ پیام آزمایشی ارسال شد؛ برای ارسال روزانه برنامه را فعال کنید." if data == "group_test" else "✅ گروه در دسترس است و بات اجازهٔ ارسال متن دارد.", edit=True)
             elif data == "menu_choose_start" or data.startswith("surahs:"):
                 page = 0 if data == "menu_choose_start" else int(data.split(":")[1])
-                text, markup = surah_picker(self.surahs, page)
+                text, markup = surah_picker(self.surahs, page, self.service.catalog_revision)
                 await render(message, text, markup, edit=True)
             elif data.startswith("surah_pick:"):
+                parts = data.split(":")
+                self.validate_catalog_button(parts[2] if len(parts) == 3 else 0)
                 await self.select(chat_id, int(data.split(":")[1]))
                 await self.panel(update, daily=True, notice="✅ سورهٔ شروع انتخاب شد.", edit=True)
             elif data in ("menu_set_interval", "menu_set_time"):
@@ -336,7 +362,11 @@ class Handlers:
                 context.user_data["state"] = state
                 await render(message, f"<b>✍️ {escape(prompt)}</b>\n\nلغو: /cancel", back_markup(), edit=True)
             elif data.startswith("select_surah_page_"):
-                _, _, _, page, index = data.split("_")
+                parts = data.split("_")
+                if len(parts) not in (5, 6):
+                    raise ValueError
+                _, _, _, page, index = parts[:5]
+                self.validate_catalog_button(parts[5] if len(parts) == 6 else 0)
                 await self.select(chat_id, int(index), int(page))
                 await self.panel(update, daily=True, notice="✅ سوره و صفحه ذخیره شد.", edit=True)
             elif data == "menu_preview":
@@ -411,7 +441,9 @@ class Handlers:
             await self.repo.update(chat_id, last_error=error_text(exc))
             await self.group_panel(update, notice="❌ عملیات انجام نشد: " + error_text(exc), edit=True)
         except ValueError as exc:
-            if data.startswith("group_") or data in ("menu_resume", "menu_send_hello") or data.startswith("media_confirm:"):
+            if data.startswith("catalog_"):
+                await self.panel(update, notice=str(exc), edit=True)
+            elif data.startswith("group_") or data in ("menu_resume", "menu_send_hello") or data.startswith("media_confirm:"):
                 await self.group_panel(update, notice="❌ " + error_text(exc), edit=True)
             else:
                 await self.panel(update, daily=True, notice="گزینه نامعتبر است؛ دوباره از منو انتخاب کنید.", edit=True)
