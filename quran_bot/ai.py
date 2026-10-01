@@ -52,7 +52,7 @@ class AIService:
     def _question(self, message) -> str:
         text = (message.text or message.caption or "").strip()
         if self._bot_username:
-            text = re.sub(rf"@{re.escape(self._bot_username)}\\b", "", text, flags=re.IGNORECASE).strip()
+            text = re.sub(rf"@{re.escape(self._bot_username)}\b", "", text, flags=re.IGNORECASE).strip()
         if not text and message.reply_to_message:
             text = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
         return text
@@ -71,7 +71,7 @@ class AIService:
             return AIReply()
         candidate = raw
         if "```" in raw:
-            match = re.search(r"```(?:json)?\\s*(\\{.*?\\})\\s*```", raw, re.DOTALL | re.IGNORECASE)
+            match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL | re.IGNORECASE)
             if match:
                 candidate = match.group(1)
         try:
@@ -86,17 +86,17 @@ class AIService:
         return AIReply(text=raw)
 
     def _messages(self, chat_id: int, question: str, system_prompt: str, media: list[dict]) -> list[dict]:
-        media_catalog = "\\n".join(
+        media_catalog = "\n".join(
             f"- key={item['media_key']} | type={item['media_type']} | {item.get('description') or 'بدون توضیح'}"
             for item in media
         ) or "(هیچ رسانه‌ای ثبت نشده)"
         system = (
             (system_prompt or "تو دستیار دوستانه و دقیق یک گروه تلگرامی فارسی‌زبان هستی.").strip()
-            + "\\n\\nپاسخ را کوتاه، کاربردی و طبیعی بنویس. از ادعای قطعی بدون اطمینان خودداری کن."
-            + "\\nاگر یکی از رسانه‌های زیر واقعاً به پاسخ کمک می‌کند، media_key همان مورد را انتخاب کن؛ در غیر این صورت null."
-            + "\\nفقط JSON معتبر با این ساختار برگردان: "
+            + "\n\nپاسخ را کوتاه، کاربردی و طبیعی بنویس. از ادعای قطعی بدون اطمینان خودداری کن."
+            + "\nاگر یکی از رسانه‌های زیر واقعاً به پاسخ کمک می‌کند، media_key همان مورد را انتخاب کن؛ در غیر این صورت null."
+            + "\nفقط JSON معتبر با این ساختار برگردان: "
               '{"text":"متن پاسخ","media_key":null}'
-            + "\\nرسانه‌های قابل استفاده:\\n" + media_catalog
+            + "\nرسانه‌های قابل استفاده:\n" + media_catalog
         )
         messages = [{"role": "system", "content": system}]
         for q, a in self._history[chat_id]:
