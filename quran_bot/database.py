@@ -15,6 +15,8 @@ FIELDS = {
     "destination_id": "INTEGER", "destination_title": "TEXT",
     "last_error": "TEXT", "last_sent_at": "REAL",
     "completed": "INTEGER DEFAULT 0", "delivery_pending": "INTEGER DEFAULT 0",
+    "ai_enabled": "INTEGER DEFAULT 0", "ai_base_url": "TEXT", "ai_api_key": "TEXT",
+    "ai_model": "TEXT", "ai_system_prompt": "TEXT",
 }
 
 
@@ -34,6 +36,14 @@ class Repository:
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("CREATE TABLE IF NOT EXISTS settings (chat_id INTEGER PRIMARY KEY)")
             await db.execute("CREATE TABLE IF NOT EXISTS catalog (id INTEGER PRIMARY KEY CHECK(id=1), content TEXT NOT NULL, revision INTEGER NOT NULL)")
+            await db.execute("""CREATE TABLE IF NOT EXISTS ai_media (
+                owner_id INTEGER NOT NULL,
+                media_key TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                description TEXT,
+                PRIMARY KEY(owner_id, media_key)
+            )""")
             async with db.execute("PRAGMA table_info(settings)") as cursor:
                 columns = {row["name"] for row in await cursor.fetchall()}
             for name, definition in FIELDS.items():
@@ -106,3 +116,34 @@ class Repository:
                              (json.dumps(updated, ensure_ascii=False), revision))
             await db.commit()
             return revision
+
+
+    async def find_ai_owner(self, destination_id: int):
+        async with self.connection() as db:
+            async with db.execute("""SELECT * FROM settings
+                WHERE ai_enabled=1 AND destination_id=?
+                  AND COALESCE(ai_base_url, '')<>''
+                  AND COALESCE(ai_api_key, '')<>''
+                  AND COALESCE(ai_model, '')<>''
+                ORDER BY chat_id LIMIT 1""", (destination_id,)) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def list_ai_media(self, owner_id: int):
+        async with self.connection() as db:
+            async with db.execute("SELECT * FROM ai_media WHERE owner_id=? ORDER BY media_key", (owner_id,)) as cursor:
+                return [dict(row) for row in await cursor.fetchall()]
+
+    async def save_ai_media(self, owner_id: int, media_key: str, media_type: str, file_id: str, description: str = ""):
+        async with self.connection() as db:
+            await db.execute("""INSERT INTO ai_media(owner_id,media_key,media_type,file_id,description)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(owner_id,media_key) DO UPDATE SET
+                  media_type=excluded.media_type,file_id=excluded.file_id,description=excluded.description""",
+                (owner_id, media_key, media_type, file_id, description))
+            await db.commit()
+
+    async def delete_ai_media(self, owner_id: int, media_key: str):
+        async with self.connection() as db:
+            await db.execute("DELETE FROM ai_media WHERE owner_id=? AND media_key=?", (owner_id, media_key))
+            await db.commit()
