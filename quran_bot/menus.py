@@ -62,6 +62,7 @@ def dashboard(row, surahs, timezone, daily=False, notice=None):
     lines.extend([
         f"{'✅ پایان‌یافته' if row.get('completed') else ('🟢 فعال' if row.get('active') else '⏸ متوقف')}  ·  روز {fa(row.get('current_day') or 1)}",
         f"👥 مقصد: {escape(row.get('destination_title') or str(row.get('destination_id') or 'انتخاب نشده'))}",
+        f"🤖 AI: {'🟢 فعال' if row.get('ai_enabled') else '⚪ غیرفعال'}",
         f"📖 سوره: <b>{escape(surah['name']) if surah else 'انتخاب نشده'}</b>",
         f"📄 صفحهٔ بعدی: {fa(row.get('current_page') or '—')}",
         f"🔁 هر {duration(row)}" if any(row.get(k) for k in ('interval_days', 'interval_hours', 'interval_minutes', 'interval_seconds')) else "🔁 دوره: تنظیم نشده",
@@ -97,7 +98,8 @@ async def show_menu(message, daily=False, *, row=None, surahs=(), timezone="Asia
         items = [("⚙️ برنامهٔ مطالعه", "menu_daily_settings", "primary"), ("👁 پیش‌نمایش", "menu_preview"),
                  ("✉️ ارسال پیام", "menu_send_custom"), ("🔄 تازه‌سازی", "menu_status"),
                  toggle, ("📅 تاریخ و ساعت", "menu_show_time"),
-                 ("👥 تنظیم گروه", "menu_group", "primary"), ("❔ راهنما", "menu_help"), ("🔒 خروج", "menu_logout")]
+                 ("👥 تنظیم گروه", "menu_group", "primary"), ("🤖 دستیار AI", "menu_ai", "primary"),
+                 ("❔ راهنما", "menu_help"), ("🔒 خروج", "menu_logout")]
     return await render(message, dashboard(row, surahs, timezone, daily, notice), keyboard(items, 2), edit=edit)
 
 

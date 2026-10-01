@@ -9,6 +9,7 @@ import pytz
 from telegram import KeyboardButton, KeyboardButtonRequestChat, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.error import Conflict, TelegramError
 
+from .ai_admin import AIAdmin
 from .catalog import normalize_name
 from .catalog_upload import CatalogUpload
 from .destination import error_text
@@ -28,8 +29,9 @@ PROMPTS = {
 
 
 class Handlers:
-    def __init__(self, config, repo, service):
+    def __init__(self, config, repo, service, ai=None):
         self.config, self.repo, self.service = config, repo, service
+        self.ai_admin = AIAdmin(repo) if ai is not None else None
         self.surahs = service.surahs
         self.attempts = {}
         self.catalog_upload = CatalogUpload(self)
@@ -190,6 +192,8 @@ class Handlers:
         chat_id = update.effective_chat.id
         text = (message.text or "").strip()
         state = context.user_data.get("state")
+        if self.ai_admin and await self.ai_admin.receive(update, context):
+            return
         if state == "catalog_upload":
             await self.catalog_upload.receive(update, context)
             return
@@ -297,6 +301,8 @@ class Handlers:
         message, data = update.effective_message, query.data or ""
         chat_id = update.effective_chat.id
         if data == "noop":
+            return
+        if self.ai_admin and await self.ai_admin.callback(update, context, data):
             return
         await self.clear_group_picker(update, context)
         context.user_data.pop("state", None)
