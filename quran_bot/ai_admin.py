@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from html import escape
 
+from telegram.error import TelegramError
+
 from .menus import keyboard, render
 
 
@@ -69,6 +71,10 @@ class AIAdmin:
                 await message.reply_text("❌ کلید API خیلی کوتاه است.")
                 return True
             await self.repo.update(owner_id, ai_api_key=text)
+            try:
+                await message.delete()
+            except TelegramError:
+                pass
         elif state == "ai_model":
             if not text or len(text) > 200:
                 await message.reply_text("❌ نام مدل نامعتبر است.")
@@ -91,8 +97,7 @@ class AIAdmin:
             if not media_type:
                 await message.reply_text("❌ فقط عکس، GIF یا استیکر بفرستید.")
                 return True
-            existing = await self.repo.list_ai_media(owner_id)
-            media_key = f"media_{len(existing) + 1}"
+            media_key = f"media_{message.message_id}"
             description = (message.caption or "").strip() or ("استیکر مناسب گفتگو" if media_type == "sticker" else "رسانه مناسب گفتگو")
             await self.repo.save_ai_media(owner_id, media_key, media_type, file_id, description[:500])
         context.user_data.pop("state", None)
