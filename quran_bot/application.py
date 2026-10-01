@@ -5,6 +5,7 @@ from telegram import BotCommand, BotCommandScopeAllPrivateChats, MenuButtonComma
 from telegram.error import TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
+from .ai import AIService
 from .catalog import load_surahs
 from .config import Config
 from .database import Repository
@@ -14,10 +15,12 @@ from .scheduling import DeliveryService
 
 def build_application(config):
     repo = Repository(config.db_path)
+    ai = AIService(repo)
     surahs = []
 
     async def startup(app):
         await repo.initialize()
+        await ai.initialize(app.bot)
         stored = await repo.get_catalog()
         if stored:
             surahs[:], service.catalog_revision = stored
@@ -42,9 +45,10 @@ def build_application(config):
     app = (Application.builder().token(config.token).post_init(startup)
            .post_stop(shutdown).post_shutdown(shutdown).build())
     service = DeliveryService(config, repo, surahs, app.bot)
-    handlers = Handlers(config, repo, service)
-    app.bot_data.update(service=service, repository=repo)
+    handlers = Handlers(config, repo, service, ai)
+    app.bot_data.update(service=service, repository=repo, ai=ai)
     private = filters.ChatType.PRIVATE
+    groups = filters.ChatType.GROUPS
     app.add_handler(CommandHandler("start", handlers.start, filters=private))
     app.add_handler(CommandHandler("cancel", handlers.cancel, filters=private))
     app.add_handler(CommandHandler(["menu", "status"], handlers.menu, filters=private))
@@ -52,6 +56,7 @@ def build_application(config):
     app.add_handler(CommandHandler("group", handlers.group, filters=private))
     app.add_handler(CallbackQueryHandler(handlers.callback))
     app.add_handler(MessageHandler(private & ~filters.COMMAND, handlers.message))
+    app.add_handler(MessageHandler(groups & ~filters.COMMAND, ai.handle_group_message))
     app.add_error_handler(handlers.error)
     return app
 
